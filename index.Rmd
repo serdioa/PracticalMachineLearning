@@ -1,0 +1,673 @@
+---
+title: "Qualitative Activity Recognition"
+author: "Alexey Serdyuk"
+date: "7 May 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Table of content
+
+* [Synopsis](#synopsis)
+* [Loading and preprocessing the data](#loading_and_preprocessing)
+* [Training first-level predictors](#training_first_level_predictors)
+* [Analysis of first-level predictors](#analysis_of_first_level_predictors)
+* [Summarized predictor](#summarized_predictor)
+* [Conclusion](#conclusion)
+
+# <a name="synopsis"></a>Synopsis
+
+This report is a programming assignment for the course "Practical Machine
+Learning" offered by
+[Coursera](https://www.coursera.org/learn/practical-machine-learning).
+
+The [Human Activity Recognition](http://groupware.les.inf.puc-rio.br/har) project
+provides a data set with various measurements collected by wearers performing
+dumbell exercises. For each observation, a quality of execution is marked as
+A, B, C, D or E, where A indicates a correct execution, and B - E indicate
+common errors. The purpose of this programming assignment is to create an
+algorithm for recognizing a quality of execution from measurements.
+
+Our approach is to create several predictors, and than to combine them in a
+final predictor.
+
+# <a name="loading_and_preprocessing"></a>Loading and preprocessing the data
+
+We load libraries required for our analysis, as well as for pretty-printing
+this report.
+
+```{r message=FALSE}
+library(caret)
+library(kableExtra)
+```
+
+We download the data, if files are not available locally yet, and load the data.
+
+```{r}
+if (!file.exists("pml-training.csv")) {
+    download.file(url = "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv",
+                  destfile = "pml-training.csv", method = "curl")
+}
+if (!file.exists("pml-testing.csv")) {
+    download.file(url = "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv",
+                  destfile = "pml-testing.csv", method = "curl")
+}
+
+trainingRaw <- read.csv("pml-training.csv", na.strings = c("NA", "", "#DIV/0!"))
+testingRaw <- read.csv("pml-testing.csv", na.strings = c("NA", "", "#DIV/0!"))
+```
+
+Many columns have NA in approximately 98% of all rows. Most algorithms are not
+able to work with the data containing NA values, so we are removing columns
+which contains mostly NA values from the data set. We are also removing columns
+irrelevant for our model, such as a name of the test person.
+
+```{r}
+naCount <- apply(trainingRaw, 2, function(x) {sum(is.na(x))})
+validColumns <- (naCount == 0)
+validColumns[1:7] <- FALSE
+trainingClean <- trainingRaw[, validColumns]
+testingClean <- testingRaw[, validColumns]
+```
+
+We explicitly set a seed of the random number generator to be able to reproduce
+results. We will reset the seed before training each model to make an order
+of the training irrelevant.
+
+```{r}
+set.seed(20190501)
+```
+
+We split the training data on several sub-sets:
+
+* Training set to train first-level predictors (60% of the data).
+* Stacking set to analyze accuracy of first-level predictors and to combine
+them into a final predictor (20% of the data).
+* Validation set to test the final predictor (20% of the data). The validation
+set will be used only once to estimate out-of-sample error.
+
+```{r}
+trainPct = 0.6
+
+inTrain <- createDataPartition(trainingClean$classe, p = 0.6)[[1]]
+training <- trainingClean[inTrain,]
+buildData <- trainingClean[-inTrain,]
+inStack = createDataPartition(buildData$classe, p = 0.5)[[1]]
+stacking <- buildData[inStack,]
+validation <- buildData[-inStack,]
+```
+
+# <a name="training_first_level_predictors"></a>Training first-level predictors
+
+As first-level predictors we will use several different algorithms, each of them
+have own weak and strong points. We have choosen the following algorithms:
+
+* Random forest (rf)
+* Bagged classification and regression trees (treebag)
+* Support Vector Machines with linear kernel (svmLinear)
+* Support Vector Machines with polynomial kernel (svmPoly)
+* Stochastic Gradient Boosting (gbm)
+* Bagged AdaBoost (AdaBag)
+* Linear Discriminant Analysis (lda)
+* Self-organizing maps (xyf)
+* Bagged Flexible Discriminant Analysis (bagFDA)
+* Model Averaged Neural Network (avNNet)
+* Multi-layer perceptron with 1 hidden layer (mlp)
+* Multi-layer perceptron with 3 hidden layers (mlpML)
+
+We start by training all algorithms on the training data set. To estimate
+quality of our models, for each model we predict values based on the training
+data set, and based on the stacking data set. The will use the first prediction
+to estimate in-sample error, and the second prediction to estimate out-of-sample
+error of first-level predictors. For accuracy analysis we calculate confusion
+matrix for each prediction.
+
+Training our models may be time-consuming. To reduce the training time, we will
+use a parallelization library supported by caret. 
+
+```{r message=FALSE}
+library(doParallel)
+
+# Detect the number of available CPU cores
+numberCpuCores <- detectCores()
+
+# Start the parallelization using all available CPU cores
+cl <- makePSOCKcluster(numberCpuCores)
+registerDoParallel(cl)
+```
+
+On our platform (Intel i5-7600K CPU with 4 cores) training all models takes
+approximately 3 hours.
+
+```{r}
+# Training models takes a long time and is a major bottleneck when fine-tuning
+# formatting of this report. To speed up, we are caching the trained models.
+# Each model is trained during the first execution and is saved into a file.
+# During subsequent executions, the model is loaded from the file.
+
+# Caching may be disabled by setting the variable model.cache to FALSE.
+model.cache <- TRUE
+
+#
+# Random forest (rf)
+#
+
+rf.model.file <- paste0("rf.model.", trainPct, ".RDS")
+if (model.cache && file.exists(rf.model.file)) {
+    rf.model <- readRDS(file = rf.model.file)
+} else {
+    set.seed(20190501)
+    rf.model <- train(classe ~ ., data = training, method = "rf",
+                      preProcess = c("center", "scale"))
+    saveRDS(object = rf.model, file = rf.model.file)
+}
+
+rf.training.predict <- predict(rf.model, training)
+rf.stacking.predict <- predict(rf.model, stacking)
+
+rf.training.confusion <- confusionMatrix(rf.training.predict, training$classe)
+rf.stacking.confusion <- confusionMatrix(rf.stacking.predict, stacking$classe)
+
+#
+# Bagged classification and regression trees (treebag)
+#
+
+treebag.model.file <- paste0("treebag.model.", trainPct, ".RDS")
+if (model.cache && file.exists(treebag.model.file)) {
+    treebag.model <- readRDS(file = treebag.model.file)
+} else {
+    set.seed(20190501)
+    treebag.model <- train(classe ~ ., data = training, method = "treebag",
+                      preProcess = c("center", "scale"))
+    saveRDS(object = treebag.model, file = treebag.model.file)
+}
+
+treebag.training.predict <- predict(treebag.model, training)
+treebag.stacking.predict <- predict(treebag.model, stacking)
+
+treebag.training.confusion <- confusionMatrix(treebag.training.predict, training$classe)
+treebag.stacking.confusion <- confusionMatrix(treebag.stacking.predict, stacking$classe)
+
+#
+# Support Vector Machines with linear kernel (svmLinear)
+#
+
+svmLinear.model.file <- paste0("svmLinear.model.", trainPct, ".RDS")
+if (model.cache && file.exists(svmLinear.model.file)) {
+    svmLinear.model <- readRDS(file = svmLinear.model.file)
+} else {
+    set.seed(20190501)
+    svmLinear.model <- train(classe ~ ., data = training, method = "svmLinear",
+                      preProcess = c("center", "scale"))
+    saveRDS(object = svmLinear.model, file = svmLinear.model.file)
+}
+
+svmLinear.training.predict <- predict(svmLinear.model, training)
+svmLinear.stacking.predict <- predict(svmLinear.model, stacking)
+
+svmLinear.training.confusion <- confusionMatrix(svmLinear.training.predict, training$classe)
+svmLinear.stacking.confusion <- confusionMatrix(svmLinear.stacking.predict, stacking$classe)
+
+#
+# Support Vector Machines with polynomial kernel (svmPoly)
+#
+
+svmPoly.model.file <- paste0("svmPoly.model.", trainPct, ".RDS")
+if (model.cache && file.exists(svmPoly.model.file)) {
+    svmPoly.model <- readRDS(file = svmPoly.model.file)
+} else {
+    set.seed(20190501)
+    svmPoly.model <- train(classe ~ ., data = training, method = "svmPoly",
+                      preProcess = c("center", "scale"))
+    saveRDS(object = svmPoly.model, file = svmPoly.model.file)
+}
+
+svmPoly.training.predict <- predict(svmPoly.model, training)
+svmPoly.stacking.predict <- predict(svmPoly.model, stacking)
+
+svmPoly.training.confusion <- confusionMatrix(svmPoly.training.predict, training$classe)
+svmPoly.stacking.confusion <- confusionMatrix(svmPoly.stacking.predict, stacking$classe)
+
+#
+# Stochastic Gradient Boosting (gbm)
+#
+
+gbm.model.file <- paste0("gbm.model.", trainPct, ".RDS")
+if (model.cache && file.exists(gbm.model.file)) {
+    gbm.model <- readRDS(file = gbm.model.file)
+} else {
+    set.seed(20190501)
+    gbm.model <- train(classe ~ ., data = training, method = "gbm",
+                      preProcess = c("center", "scale"))
+    saveRDS(object = gbm.model, file = gbm.model.file)
+}
+
+gbm.training.predict <- predict(gbm.model, training)
+gbm.stacking.predict <- predict(gbm.model, stacking)
+
+gbm.training.confusion <- confusionMatrix(gbm.training.predict, training$classe)
+gbm.stacking.confusion <- confusionMatrix(gbm.stacking.predict, stacking$classe)
+
+#
+# Bagged AdaBoost (AdaBag)
+#
+
+AdaBag.model.file <- paste0("AdaBag.model.", trainPct, ".RDS")
+if (model.cache && file.exists(AdaBag.model.file)) {
+    AdaBag.model <- readRDS(file = AdaBag.model.file)
+} else {
+    set.seed(20190501)
+    AdaBag.model <- train(classe ~ ., data = training, method = "AdaBag",
+                      preProcess = c("center", "scale"))
+    saveRDS(object = AdaBag.model, file = AdaBag.model.file)
+}
+
+AdaBag.training.predict <- predict(AdaBag.model, training)
+AdaBag.stacking.predict <- predict(AdaBag.model, stacking)
+
+AdaBag.training.confusion <- confusionMatrix(AdaBag.training.predict, training$classe)
+AdaBag.stacking.confusion <- confusionMatrix(AdaBag.stacking.predict, stacking$classe)
+
+#
+# Linear Discriminant Analysis (lda)
+#
+
+lda.model.file <- paste0("lda.model.", trainPct, ".RDS")
+if (model.cache && file.exists(lda.model.file)) {
+    lda.model <- readRDS(file = lda.model.file)
+} else {
+    set.seed(20190501)
+    lda.model <- train(classe ~ ., data = training, method = "lda",
+                      preProcess = c("center", "scale"))
+    saveRDS(object = lda.model, file = lda.model.file)
+}
+
+lda.training.predict <- predict(lda.model, training)
+lda.stacking.predict <- predict(lda.model, stacking)
+
+lda.training.confusion <- confusionMatrix(lda.training.predict, training$classe)
+lda.stacking.confusion <- confusionMatrix(lda.stacking.predict, stacking$classe)
+
+#
+# Self-organizing maps (xyf)
+#
+
+xyf.model.file <- paste0("xyf.model.", trainPct, ".RDS")
+if (model.cache && file.exists(xyf.model.file)) {
+    xyf.model <- readRDS(file = xyf.model.file)
+} else {
+    set.seed(20190501)
+    xyf.model <- train(classe ~ ., data = training, method = "xyf",
+                      preProcess = c("center", "scale"))
+    saveRDS(object = xyf.model, file = xyf.model.file)
+}
+
+xyf.training.predict <- predict(xyf.model, training)
+xyf.stacking.predict <- predict(xyf.model, stacking)
+
+xyf.training.confusion <- confusionMatrix(xyf.training.predict, training$classe)
+xyf.stacking.confusion <- confusionMatrix(xyf.stacking.predict, stacking$classe)
+
+#
+# Bagged Flexible Discriminant Analysis (bagFDA)
+#
+
+bagFDA.model.file <- paste0("bagFDA.model.", trainPct, ".RDS")
+if (model.cache && file.exists(bagFDA.model.file)) {
+    bagFDA.model <- readRDS(file = bagFDA.model.file)
+} else {
+    set.seed(20190501)
+    bagFDA.model <- train(classe ~ ., data = training, method = "bagFDA",
+                      preProcess = c("center", "scale"))
+    saveRDS(object = bagFDA.model, file = bagFDA.model.file)
+}
+
+bagFDA.training.predict <- predict(bagFDA.model, training)
+bagFDA.stacking.predict <- predict(bagFDA.model, stacking)
+
+bagFDA.training.confusion <- confusionMatrix(bagFDA.training.predict, training$classe)
+bagFDA.stacking.confusion <- confusionMatrix(bagFDA.stacking.predict, stacking$classe)
+
+#
+# Model Averaged Neural Network (avNNet)
+#
+
+avNNet.model.file <- paste0("avNNet.model.", trainPct, ".RDS")
+if (model.cache && file.exists(avNNet.model.file)) {
+    avNNet.model <- readRDS(file = avNNet.model.file)
+} else {
+    set.seed(20190501)
+    avNNet.model <- train(classe ~ ., data = training, method = "avNNet",
+                      preProcess = c("center", "scale"))
+    saveRDS(object = avNNet.model, file = avNNet.model.file)
+}
+
+avNNet.training.predict <- predict(avNNet.model, training)
+avNNet.stacking.predict <- predict(avNNet.model, stacking)
+
+avNNet.training.confusion <- confusionMatrix(avNNet.training.predict, training$classe)
+avNNet.stacking.confusion <- confusionMatrix(avNNet.stacking.predict, stacking$classe)
+
+#
+# Multi-layer perceptron with 1 hidden layer (mlp)
+#
+
+mlp.model.file <- paste0("mlp.model.", trainPct, ".RDS")
+if (model.cache && file.exists(mlp.model.file)) {
+    mlp.model <- readRDS(file = mlp.model.file)
+} else {
+    mlpGrid <-  expand.grid(size = c(1:4, (1:12)*5))
+
+    set.seed(20190501)
+    mlp.model <- train(classe ~ ., data = training, method = "mlp",
+                       tuneGrid = mlpGrid, preProcess = c("center", "scale"))
+    
+    saveRDS(object = mlp.model, file = mlp.model.file)
+}
+
+mlp.training.predict <- predict(mlp.model, training)
+mlp.stacking.predict <- predict(mlp.model, stacking)
+
+mlp.training.confusion <- confusionMatrix(mlp.training.predict, training$classe)
+mlp.stacking.confusion <- confusionMatrix(mlp.stacking.predict, stacking$classe)
+
+#
+# Multi-layer perceptron with 3 hidden layers (mlpML)
+#
+
+mlpML.model.file <- paste0("mlpML.model.", trainPct, ".RDS")
+if (model.cache && file.exists(mlpML.model.file)) {
+    mlpML.model <- readRDS(file = mlpML.model.file)
+} else {
+    mlpMLGrid <-  expand.grid(layer1 = c(20, 40, 60),
+                              layer2 = c(20, 40, 60),
+                              layer3 = c(20, 40, 60))
+    
+    set.seed(20190501)
+    mlpML.model <- train(classe ~ ., data = training, method = "mlpML",
+                         tuneGrid = mlpMLGrid, preProcess = c("center", "scale"))
+    saveRDS(object = mlpML.model, file = mlpML.model.file)
+}
+
+mlpML.training.predict <- predict(mlpML.model, training)
+mlpML.stacking.predict <- predict(mlpML.model, stacking)
+
+mlpML.training.confusion <- confusionMatrix(mlpML.training.predict, training$classe)
+mlpML.stacking.confusion <- confusionMatrix(mlpML.stacking.predict, stacking$classe)
+
+```
+
+After training all first-level predictors, we turn off the parallelization library.
+
+```{r}
+stopCluster(cl)
+```
+
+# <a name="analysis_of_first_level_predictors"></a>Analysis of first-level predictors
+
+For each first-level predictor we calculate statistics for testing and
+stacking data sets. The table below contains the most important numbers.
+R code for formatting the table is available in the Rmd file.
+
+```{r echo = FALSE}
+# Names of used models
+models <- c("rf", "treebag", "svmLinear", "svmPoly", "gbm", "AdaBag", "lda",
+            "xyf", "bagFDA", "avNNet", "mlp", "mlpML")
+
+# Collect statictics for the model with the specified name evaluated at the
+# specified stage (training, stacking, validation)
+getModelStat = function(model, stage) {
+    result <- list()
+
+    result$name <- model
+    result$stage <- stage
+
+    data <- get(stage)
+    result$data.length <- nrow(data)
+
+    data.expect  <- data$classe
+    data.predict <- get(paste0(model, ".", stage, ".predict"))
+    result$predict.true <- sum(data.expect == data.predict)
+    result$predict.false <- sum(data.expect != data.predict)
+
+    data.confusion <- get(paste0(model, ".", stage, ".confusion"))
+    result$accuracy <- data.confusion$overall["Accuracy"]
+    result$accuracyLower <- data.confusion$overall["AccuracyLower"]
+    result$accuracyUpper <- data.confusion$overall["AccuracyUpper"]
+
+    result
+}
+
+# Collect statictics for all specified models at the specified stage
+getModelsForStage = function(models, stage) {
+    sapply(models, function(x) {getModelStat(x, stage)},
+           USE.NAMES = TRUE, simplify = FALSE)
+}
+
+# Collect statistics for all models on training and stacking stages
+models.training <- getModelsForStage(models, "training")
+models.stacking <- getModelsForStage(models, "stacking")
+
+# Prepare statistics for pretty-printing
+model.stats <- data.frame(
+    "name" = models,
+    "training.data.length" = sapply(models.training, function(x) {
+        x$data.length
+    }),
+    "training.predict.false" = sapply(models.training, function(x) {
+        x$predict.false
+    }),
+    "training.accuracy" = sapply(models.training, function(x) {
+        sprintf("%.4f", x$accuracy)
+    }),
+    "training.confidence" = sapply(models.training, function(x) {
+        sprintf("(%.4f, %.4f)", x$accuracyLower, x$accuracyUpper)
+    }),
+    "stacking.data.length" = sapply(models.stacking, function(x) {
+        x$data.length
+    }),
+    "stacking.predict.false" = sapply(models.stacking, function(x) {
+        x$predict.false
+    }),
+    "stacking.accuracy" = sapply(models.stacking, function(x) {
+        sprintf("%.4f", x$accuracy)
+    }),
+    "stacking.confidence" = sapply(models.stacking, function(x) {
+        sprintf("(%.4f, %.4f)", x$accuracyLower, x$accuracyUpper)
+    })
+    )
+rownames(model.stats) <- NULL
+
+kable(model.stats,
+      booktabs = TRUE,
+      col.names = c("Predictor",
+                    "No. of samples",
+                    "Failed predictions",
+                    "Accuracy",
+                    "CI (95%)",
+                    "No. of samples",
+                    "Failed predictions",
+                    "Accuracy",
+                    "CI (95%)")) %>%
+    add_header_above(header = c("",
+                                "Training (in-sample)" = 4,
+                                "Stacking (out-of-sample)" = 4)) %>%
+    kable_styling(bootstrap_options = c("striped", "bordered", "hover"),
+                  full_width = FALSE)
+```
+
+As we see, algorithms have very different in-sample and out-of-sample accuracy.
+Two best algorithms (rf and svmPoly) have out-of-sample accuracy over 99%,
+whereas the worst (AdaBag and xyf) are below 50%. The table provides 95%
+confidence intervals for accuracy as well.
+
+# <a name="summarized_predictor"></a>Summarized predictor
+
+Now we are going to build a summarized predictor based on 6 first-level
+predictors which have out-of-sample accuracy above 90%: rf, treebag, svmPoly,
+gbm, mlp and mlpMP. We will train the final predictor using Random Forest (rf)
+algorithm.
+
+```{r}
+stacking.data <- data.frame("classe" = stacking$classe,
+                            "rf" = rf.stacking.predict,
+                            "treebag" = treebag.stacking.predict,
+                            "svmPoly" = svmPoly.stacking.predict,
+                            "gbm" = gbm.stacking.predict,
+                            "mlp" = mlp.stacking.predict,
+                            "mlpML" = mlpML.stacking.predict)
+
+summarized.model.file <- paste0("summarized.model.", trainPct, ".RDS")
+if (model.cache && file.exists(summarized.model.file)) {
+    summarized.model <- readRDS(file = summarized.model.file)
+} else {
+    set.seed(20190501)
+    summarized.model <- train(classe ~ ., data = stacking.data, method = "rf")
+    saveRDS(object = summarized.model, file = summarized.model.file)
+}
+
+summarized.stacking.predict <- predict(summarized.model, stacking.data)
+summarized.stacking.confusion <- confusionMatrix(summarized.stacking.predict,
+                                                 stacking.data$classe)
+```
+
+```{r echo = FALSE}
+models <- c("rf", "treebag", "svmPoly", "gbm", "mlp", "mlpML", "summarized")
+
+# Collect statistics for summarized model on stacking data set
+models.stacking <- getModelsForStage(models, "stacking")
+
+# Prepare statistics for pretty-printing
+model.stats <- data.frame(
+    "name" = models,
+    "stacking.data.length" = sapply(models.stacking, function(x) {
+        x$data.length
+   }),
+   "stacking.predict.false" = sapply(models.stacking, function(x) {
+       x$predict.false
+   }),
+   "stacking.accuracy" = sapply(models.stacking, function(x) {
+       sprintf("%.4f", x$accuracy)
+   }),
+   "stacking.confidence" = sapply(models.stacking, function(x) {
+       sprintf("(%.4f, %.4f)", x$accuracyLower, x$accuracyUpper)
+   })
+   )
+rownames(model.stats) <- NULL
+
+kable(model.stats,
+      booktabs = TRUE,
+      col.names = c("Predictor",
+                    "No. of samples",
+                    "Failed predictions",
+                    "Accuracy",
+                    "CI (95%)")) %>%
+    add_header_above(header = c("",
+                                "Stacking (in-sample)" = 4)) %>%
+    kable_styling(bootstrap_options = c("striped", "bordered", "hover"),
+                  full_width = FALSE)
+```
+
+The summarized predictor based on 6 first-level predictors is more accurate
+as any of the first-level predictors, with an in-sample accuracy of 
+`r sprintf("%.2f%%", models.stacking$summarized$accuracy * 100)`
+and an estimated 95% confidence interval `r sprintf("(%.2f%%, %.2f%%)",
+models.stacking$summarized$accuracyLower * 100,
+models.stacking$summarized$accuracyUpper * 100)`.
+
+Finally, we run all first-level predictors, as well as the summarizing predictor
+on the validation data set to get a final accuracy estimation. Since we have not
+used the validation data set before, this test will give us an out-of-sample
+estimation.
+
+```{r}
+rf.validation.predict <- predict(rf.model, validation)
+rf.validation.confusion <- confusionMatrix(rf.validation.predict, validation$classe)
+ 
+treebag.validation.predict <- predict(treebag.model, validation)
+treebag.validation.confusion <- confusionMatrix(treebag.validation.predict, validation$classe)
+ 
+svmPoly.validation.predict <- predict(svmPoly.model, validation)
+svmPoly.validation.confusion <- confusionMatrix(svmPoly.validation.predict, validation$classe)
+ 
+gbm.validation.predict <- predict(gbm.model, validation)
+gbm.validation.confusion <- confusionMatrix(gbm.validation.predict, validation$classe)
+ 
+mlp.validation.predict <- predict(mlp.model, validation)
+mlp.validation.confusion <- confusionMatrix(mlp.validation.predict, validation$classe)
+ 
+mlpML.validation.predict <- predict(mlpML.model, validation)
+mlpML.validation.confusion <- confusionMatrix(mlpML.validation.predict, validation$classe)
+
+validation.data <- data.frame("classe" = validation$classe,
+                              "rf" = rf.validation.predict,
+                              "treebag" = treebag.validation.predict,
+                              "svmPoly" = svmPoly.validation.predict,
+                              "gbm" = gbm.validation.predict,
+                              "mlp" = mlp.validation.predict,
+                              "mlpML" = mlpML.validation.predict)
+
+summarized.validation.predict <- predict(summarized.model, validation.data)
+summarized.validation.confusion <- confusionMatrix(summarized.validation.predict,
+                                                   validation.data$classe)
+```
+
+```{r echo = FALSE}
+models <- c("rf", "treebag", "svmPoly", "gbm", "mlp", "mlpML", "summarized")
+ 
+# Collect statistics for summarized model on validation data set
+models.validation <- getModelsForStage(models, "validation")
+ 
+# Prepare statistics for pretty-printing
+model.stats <- data.frame(
+    "name" = models,
+    "validation.data.length" = sapply(models.validation, function(x) {
+        x$data.length
+    }),
+    "validation.predict.false" = sapply(models.validation, function(x) {
+        x$predict.false
+    }),
+    "validation.accuracy" = sapply(models.validation, function(x) {
+        sprintf("%.4f", x$accuracy)
+    }),
+    "validation.confidence" = sapply(models.validation, function(x) {
+        sprintf("(%.4f, %.4f)", x$accuracyLower, x$accuracyUpper)
+    })
+    )
+rownames(model.stats) <- NULL
+
+kable(model.stats,
+      booktabs = TRUE,
+      col.names = c("Predictor",
+                    "No. of samples",
+                    "Failed predictions",
+                    "Accuracy",
+                    "CI (95%)")) %>%
+    add_header_above(header = c("",
+                                "Validation (out-of-sample)" = 4)) %>%
+    kable_styling(bootstrap_options = c("striped", "bordered", "hover"),
+                  full_width = FALSE)
+```
+
+As we see in the table above, accuracy on the validation data set is very close
+to the stacking data set. Although first-level predictors show slightly
+different results, the summatized predictor has out-of-sample accuracy of
+`r sprintf("%.2f%%", models.validation$summarized$accuracy * 100)`
+and an estimated 95% confidence interval 
+`r sprintf("(%.2f%%, %.2f%%)", models.validation$summarized$accuracyLower * 100,
+models.validation$summarized$accuracyUpper * 100)`.
+
+# <a name="conclusion"></a>Conclusion
+
+We trained 6 first-level predictors based on different algorithms, and created
+a final predictor based on them. The final predictor demonstrated
+`r sprintf("%.2f%%", models.validation$summarized$accuracy * 100)`
+accuracy on a validation data set, with a 95% confidence interval  
+`r sprintf("(%.2f%%, %.2f%%)", models.validation$summarized$accuracyLower * 100,
+models.validation$summarized$accuracyUpper * 100)`.
+
+The summarized algorithms scored 20 of 20 points on testing data set used as
+a final quiz for this Coursera course.
