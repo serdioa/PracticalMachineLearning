@@ -665,7 +665,7 @@ models.validation$summarized$accuracyUpper * 100)`.
 We trained 6 first-level predictors based on different algorithms, and created
 a final predictor based on them. The final predictor demonstrated
 `r sprintf("%.2f%%", models.validation$summarized$accuracy * 100)`
-accuracy on a validation data set, with a 95% confidence interval  
+accuracy on a validation data set, with a 95% confidence interval 
 `r sprintf("(%.2f%%, %.2f%%)", models.validation$summarized$accuracyLower * 100,
 models.validation$summarized$accuracyUpper * 100)`.
 
